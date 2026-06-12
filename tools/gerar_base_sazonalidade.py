@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Gerador da BASE DE SAZONALIDADE para o Controle de Auditoria de Lote.
+
+O que faz
+---------
+Lê o export bruto de vendas (arquivo .xlsx grande, com VÁRIAS abas), filtra os
+CFOP de venda (conta o MÊS QUE VENDEU, não o que entregou), agrega por
+PRODUTO x FILIAL x MÊS e cospe um arquivo PEQUENO (sazonal_base.json) no mesmo
+formato compacto que o app usa. O arquivão de 310 MB NUNCA sai da sua máquina.
+
+Como usar (Windows / Mac / Linux)
+---------------------------------
+1) Instale o Python 3.9+ (https://www.python.org/downloads/  — marque "Add to PATH").
+2) Instale as dependências (uma vez só), no Prompt/Terminal:
+
+       pip install pandas openpyxl
+
+3) Rode, apontando para o seu arquivo de vendas:
+
+       python gerar_base_sazonalidade.py "C:\\caminho\\vendas_jan24_jun26.xlsx"
+
+   (coloque o caminho entre aspas se tiver espaços)
+
+4) Ele vai IMPRIMIR as colunas que detectou e pedir confirmação. Se o mapeamento
+   estiver certo, ele gera "sazonal_base.json" na mesma pasta. Esse arquivo é
+   pequeno — é só ele que você me envia (ou faz commit).
+
+Se a detecção automática errar alguma coluna, edite o bloco COLUNAS_MANUAIS lá
+embaixo (logo após os imports) com o nome EXATO da coluna no seu arquivo.
+
+Regras de negócio (iguais às do app)
+------------------------------------
+- CFOP de venda contados:   5101 5102 5120 5405 6101 6102 5922 6922
+  (5922/6922 = faturamento p/ entrega futura -> é VENDA, conta no mês do faturamento)
+- CFOP excluídos (remessa de entrega futura, NÃO é venda): 5116 5117 6116 6117
+- Período mantido: Jan/2024 a Jun/2026 (configurável abaixo).
+- Sazonalidade medida em UNIDADES (soma da quantidade), por mês (Jan=0 ... Dez=11).
+"""
+
+import sys, os, json, re, argparse
+from datetime import datetime, date
+
+# ======================= CONFIGURAÇÃO =======================
+
+# CFOPs (apenas os 4 últimos dígitos importam)
+CFOPS_VENDA   = {"5101", "5102", "5120", "5405", "6101", "6102", "5922", "6922"}
+CFOPS_EXCLUIR = {"5116", "5117", "6116", "6117"}
+
+# Janela de histórico mantida (ano, mês) inclusive
+PERIODO_INI = (2024, 1)
+PERIODO_FIM = (2026, 6)
+
+# Ordem fixa das siglas usada pelo app (NÃO reordenar — os índices casam com a base embutida).
+# Siglas novas encontradas no arquivo são acrescentadas ao final automaticamente.
+BASE_SIGLAS = ["ALT","ARG","BAR","CAN","CON","CRI","FAG","FAP","FCB","FOR","GRA",
+               "GUA","GUR","IMP","JAT","JUS","MAR","MIN","MOR","MOZ","PAL","PGM",
+               "PLA","POR","RED","RIA","RVD","SFX","UBR","UNA","URU","VNP","XRA"]
+
+# Mapa: número da filial -> sigla (para o caso de o arquivo trazer a filial por número).
+NUM2SIGLA = {
+    1:"MTZ", 3:"ARG", 4:"RVD", 5:"UBR", 10:"MAR", 11:"JAT", 12:"CRI", 13:"FAG",
+    14:"RED", 16:"IMP", 17:"BAR", 19:"PAL", 21:"MOZ", 22:"PGM", 23:"SFX", 24:"FAP",
+    25:"FCB", 27:"URU", 28:"MOR", 29:"CON", 30:"FOR", 31:"JUS", 32:"XRA", 34:"POR",
+    35:"PLA", 36:"GRA", 37:"CAN", 38:"GUR", 40:"RIA", 41:"ALT",
+}
+
+# Se a detecção automática errar, preencha aqui com o NOME EXATO da coluna no seu
+# arquivo (deixe None para detecção automática). Ex.: "COD_PRODUTO": "Cód. Produto"
+COLUNAS_MANUAIS = {
+    "produto":   None,   # código do produto
+    "nome":      None,   # nome do produto (opcional)
+    "filial":    None,   # sigla OU número da filial
+    "data":      None,   # data de emissão/venda (NÃO a data de entrega)
+    "cfop":      None,   # CFOP
+    "quantidade":None,   # quantidade vendida
+}
+
+# Palavras-chave para detectar cada coluna automaticamente (minúsculas, sem acento).
+PISTAS = {
+    "produto":    [["cod", "produto"], ["codigo", "produto"], ["cod", "prod"], ["id", "produto"], ["produto", "codigo"]],
+    "nome":       [["nome", "produto"], ["descricao", "produto"], ["produto", "nome"], ["descricao"]],
+    "filial":     [["filial"], ["loja"], ["sigla"], ["unidade"], ["empresa"]],
+    "data":       [["data", "emiss"], ["dt", "emiss"], ["data", "venda"], ["data", "moviment"], ["emissao"], ["data"], ["dt", "venda"]],
+    "cfop":       [["cfop"], ["natureza", "oper"], ["nat", "op"]],
+    "quantidade": [["quant"], ["qtd"], ["qtde"], ["qte"]],
+}
+
+# ======================= UTILIDADES =======================
+
+def strip_acentos(s):
+    repl = (("á","a"),("à","a"),("ã","a"),("â","a"),("é","e"),("ê","e"),("í","i"),
+            ("ó","o"),("ô","o"),("õ","o"),("ú","u"),("ç","c"))
+    s = s.lower()
+    for a, b in repl:
+        s = s.replace(a, b)
+    return s
+
+def achar_coluna(headers, pistas, manual):
+    """Retorna o nome do cabeçalho que melhor casa com as pistas, ou None."""
+    if manual:
+        for h in headers:
+            if str(h).strip() == str(manual).strip():
+                return h
+        print(f"  [aviso] coluna manual '{manual}' não encontrada — tentando detecção automática.")
+    norm = {h: strip_acentos(str(h)) for h in headers}
+    for grupo in pistas:
+        for h, hn in norm.items():
+            if all(p in hn for p in grupo):
+                return h
+    return None
+
+def parse_qtd(v):
+    if v is None: return 0.0
+    s = str(v).strip()
+    if s == "" or s.lower() == "nan": return 0.0
+    s = s.replace("R$", "").replace(" ", "")
+    # número pt-BR: 1.234,56 -> 1234.56
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+def parse_cfop(v):
+    if v is None: return ""
+    d = re.sub(r"\D", "", str(v))
+    return d[-4:] if len(d) >= 4 else d
+
+def parse_ano_mes(v):
+    """Retorna (ano, mes) 1-12, ou None. Aceita datetime, serial Excel e strings pt-BR."""
+    if v is None: return None
+    if isinstance(v, (datetime, date)):
+        return (v.year, v.month)
+    s = str(v).strip()
+    if s == "" or s.lower() == "nan": return None
+    # serial do Excel (ex.: "45292")
+    if re.fullmatch(r"\d{5}", s):
+        try:
+            base = datetime(1899, 12, 30)
+            dt = base.fromordinal(base.toordinal() + int(s))
+            return (dt.year, dt.month)
+        except Exception:
+            pass
+    # formatos comuns
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y",
+                "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(s[:len(fmt)+8], fmt)
+            return (dt.year, dt.month)
+        except ValueError:
+            continue
+    # só mês/ano: 01/2024 ou 2024-01
+    m = re.match(r"(\d{1,2})[/\-](\d{4})$", s)
+    if m: return (int(m.group(2)), int(m.group(1)))
+    m = re.match(r"(\d{4})[/\-](\d{1,2})$", s)
+    if m: return (int(m.group(1)), int(m.group(2)))
+    return None
+
+def no_periodo(ano, mes):
+    return PERIODO_INI <= (ano, mes) <= PERIODO_FIM
+
+def resolver_sigla(v, siglas_idx):
+    """Converte o conteúdo da coluna filial em sigla de 3 letras."""
+    if v is None: return None
+    s = str(v).strip().upper()
+    if s == "" or s == "NAN": return None
+    # número da filial
+    dnum = re.sub(r"\D", "", s)
+    if dnum and dnum == s.replace(".0", ""):
+        n = int(dnum)
+        if n in NUM2SIGLA: return NUM2SIGLA[n]
+    # "28 - MORRINHOS" -> tenta número antes do hífen
+    m = re.match(r"\s*(\d+)\s*[-–]", s)
+    if m and int(m.group(1)) in NUM2SIGLA:
+        return NUM2SIGLA[int(m.group(1))]
+    # já é sigla de 3 letras conhecida
+    sig = re.sub(r"[^A-Z]", "", s)[:3]
+    if sig in siglas_idx or len(sig) == 3:
+        return sig
+    return sig or None
+
+# ======================= PROCESSAMENTO =======================
+
+def main():
+    ap = argparse.ArgumentParser(description="Gera sazonal_base.json a partir do export de vendas.")
+    ap.add_argument("arquivo", help="caminho do .xlsx de vendas (com várias abas)")
+    ap.add_argument("-o", "--saida", default="sazonal_base.json", help="arquivo de saída (padrão: sazonal_base.json)")
+    ap.add_argument("--sim", action="store_true", help="não perguntar confirmação (assume sim)")
+    args = ap.parse_args()
+
+    try:
+        import pandas as pd
+    except ImportError:
+        print("ERRO: pandas não instalado. Rode:  pip install pandas openpyxl")
+        sys.exit(1)
+
+    if not os.path.exists(args.arquivo):
+        print(f"ERRO: arquivo não encontrado: {args.arquivo}")
+        sys.exit(1)
+
+    print(f"\nLendo {args.arquivo} ...")
+    xls = pd.read_excel(args.arquivo, sheet_name=None, dtype=str, engine="openpyxl")
+    print(f"Abas encontradas: {len(xls)} -> {', '.join(xls.keys())}\n")
+
+    siglas = list(BASE_SIGLAS)            # ordem estável; novas siglas vão para o fim
+    sig2idx = {s: i for i, s in enumerate(siglas)}
+
+    # base[cod] = { idx_filial: [12 meses de float] }; nomes[cod] = nome
+    base = {}
+    nomes = {}
+
+    tot_linhas = tot_venda = tot_excluidas = tot_fora_periodo = tot_sem_data = tot_sem_prod = 0
+    cfops_ignorados = {}
+
+    for nome_aba, df in xls.items():
+        if df is None or df.empty:
+            print(f"  Aba '{nome_aba}': vazia, pulando.")
+            continue
+        headers = list(df.columns)
+        col = {k: achar_coluna(headers, PISTAS[k], COLUNAS_MANUAIS[k]) for k in PISTAS}
+
+        print(f"  Aba '{nome_aba}' ({len(df)} linhas) — colunas detectadas:")
+        for k in ["produto", "filial", "data", "cfop", "quantidade", "nome"]:
+            print(f"      {k:11s}: {col[k]}")
+        faltando = [k for k in ("produto", "filial", "data", "cfop", "quantidade") if not col[k]]
+        if faltando:
+            print(f"  [ERRO] não consegui detectar: {faltando}. Edite COLUNAS_MANUAIS e rode de novo.\n")
+            sys.exit(2)
+
+        # Confirmação só na primeira aba
+        if nome_aba == list(xls.keys())[0] and not args.sim:
+            amostra = df[[col['produto'], col['filial'], col['data'], col['cfop'], col['quantidade']]].head(3)
+            print("\n  Amostra (3 primeiras linhas):")
+            print(amostra.to_string(index=False))
+            print("\n  IMPORTANTE: a coluna 'data' deve ser a de EMISSÃO/VENDA (não a de entrega).")
+            resp = input("  As colunas estão corretas? [s/N] ").strip().lower()
+            if resp not in ("s", "sim", "y", "yes"):
+                print("Cancelado. Ajuste COLUNAS_MANUAIS e rode novamente.")
+                sys.exit(0)
+        print()
+
+        cprod, cfil, cdata, ccfop, cqtd = col['produto'], col['filial'], col['data'], col['cfop'], col['quantidade']
+        cnome = col['nome']
+
+        for row in df.itertuples(index=False):
+            tot_linhas += 1
+            rd = dict(zip(headers, row))
+            cfop = parse_cfop(rd.get(ccfop))
+            if cfop in CFOPS_EXCLUIR:
+                tot_excluidas += 1
+                continue
+            if cfop not in CFOPS_VENDA:
+                cfops_ignorados[cfop] = cfops_ignorados.get(cfop, 0) + 1
+                continue
+            am = parse_ano_mes(rd.get(cdata))
+            if am is None:
+                tot_sem_data += 1
+                continue
+            ano, mes = am
+            if not no_periodo(ano, mes):
+                tot_fora_periodo += 1
+                continue
+            cod = str(rd.get(cprod) or "").strip()
+            cod = re.sub(r"\.0$", "", cod)
+            if not cod or cod.lower() == "nan":
+                tot_sem_prod += 1
+                continue
+            sigla = resolver_sigla(rd.get(cfil), siglas)
+            if not sigla:
+                continue
+            if sigla not in sig2idx:
+                sig2idx[sigla] = len(siglas)
+                siglas.append(sigla)
+            idx = sig2idx[sigla]
+            qtd = parse_qtd(rd.get(cqtd))
+            if qtd <= 0:
+                continue
+            tot_venda += 1
+            base.setdefault(cod, {}).setdefault(idx, [0.0] * 12)[mes - 1] += qtd
+            if cnome and cod not in nomes:
+                nm = str(rd.get(cnome) or "").strip()
+                if nm and nm.lower() != "nan":
+                    nomes[cod] = nm
+
+    # ---- Monta estrutura compacta: cod -> [geralSparse, {idx: mesesSparse}] ----
+    def sparse(arr):
+        return {str(i): int(round(v)) for i, v in enumerate(arr) if round(v) != 0}
+
+    sazonal = {}
+    for cod, filiais in base.items():
+        geral = [0.0] * 12
+        fil_sparse = {}
+        for idx, meses in filiais.items():
+            for i in range(12):
+                geral[i] += meses[i]
+            sp = sparse(meses)
+            if sp:
+                fil_sparse[str(idx)] = sp
+        sazonal[cod] = [sparse(geral), fil_sparse]
+
+    saida = {
+        "siglas": siglas,
+        "ate": f"{PERIODO_FIM[0]:04d}-{PERIODO_FIM[1]:02d}",
+        "fonte": os.path.basename(args.arquivo),
+        "gerado_em": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "base": sazonal,
+        "nomes": nomes,
+    }
+
+    with open(args.saida, "w", encoding="utf-8") as f:
+        json.dump(saida, f, ensure_ascii=False, separators=(",", ":"))
+
+    tam_kb = os.path.getsize(args.saida) / 1024
+    print("=" * 60)
+    print("RESUMO")
+    print(f"  Linhas lidas .............: {tot_linhas:,}".replace(",", "."))
+    print(f"  Vendas contadas ..........: {tot_venda:,}".replace(",", "."))
+    print(f"  Remessa entrega futura ...: {tot_excluidas:,} (excluídas)".replace(",", "."))
+    print(f"  Fora do período ..........: {tot_fora_periodo:,}".replace(",", "."))
+    print(f"  Sem data válida ..........: {tot_sem_data:,}".replace(",", "."))
+    print(f"  Sem código de produto ....: {tot_sem_prod:,}".replace(",", "."))
+    print(f"  Produtos na base .........: {len(sazonal):,}".replace(",", "."))
+    print(f"  Filiais (siglas) .........: {len(siglas)}")
+    if cfops_ignorados:
+        top = sorted(cfops_ignorados.items(), key=lambda x: -x[1])[:10]
+        print(f"  CFOPs ignorados (não-venda): {', '.join(f'{c}({n})' for c, n in top)}")
+    print(f"\n  >> Gerado: {args.saida}  ({tam_kb:,.0f} KB)".replace(",", "."))
+    print("     Envie SOMENTE esse arquivo (ou faça commit dele).")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
