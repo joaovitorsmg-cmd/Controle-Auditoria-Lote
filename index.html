@@ -1435,6 +1435,7 @@
       </div>
     </div>
     <div class="topbar-right">
+      <select id="seletor-filial" class="select-sm hidden" onchange="trocarFilial(this.value)" title="Selecionar filial para análise" style="max-width:220px;"></select>
       <div class="filial-badge" id="filial-badge" style="background:var(--bg3);border:1px solid var(--border);padding:5px 12px;border-radius:20px;font-size:12px;font-weight:700;display:flex;align-items:center;gap:7px;">
         <div class="dot" style="background:var(--text3);width:7px;height:7px;border-radius:50%;"></div>
         <span id="filial-nome">Sem filial</span>
@@ -2198,14 +2199,20 @@ function carregarLotes(input) {
         throw new Error('VALIDACAO::Nenhum lote válido foi encontrado no arquivo.\n\nVerifique se o relatório contém dados e se as colunas estão corretas.');
       }
 
-      APP.lotes = lotesTemp;
-      APP.sigla = APP.lotes[0]?.sigla || '—';
-      APP.filial = APP.lotes[0]?.filial || '—';
+      // Guarda TODOS os lotes importados (pode conter mais de uma filial).
+      APP.allLotes = lotesTemp;
+      // Filiais distintas presentes no arquivo (ordenadas por sigla).
+      const siglasArq = [...new Set(lotesTemp.map(l => l.sigla).filter(Boolean))].sort();
+      popularSeletorFilial(siglasArq);
+      // Se houver mais de uma filial, foca na primeira; se só uma, lê completo.
+      const siglaInicial = siglasArq[0] || (lotesTemp[0]?.sigla || '—');
+      aplicarFilial(siglaInicial, false);
       APP.lotesLoaded = true;
       card.classList.remove('loading');
       card.classList.add('loaded');
       const avisoInvalidas = linhasInvalidas > 0 ? ` (${linhasInvalidas} linha${linhasInvalidas>1?'s':''} ignorada${linhasInvalidas>1?'s':''})` : '';
-      document.getElementById('status-lotes').textContent = `✓ ${APP.lotes.length} lotes carregados — Filial ${APP.sigla}${avisoInvalidas}`;
+      const avisoMulti = siglasArq.length > 1 ? ` · ${siglasArq.length} filiais no arquivo (analisando ${APP.sigla})` : '';
+      document.getElementById('status-lotes').textContent = `✓ ${APP.allLotes.length} lotes carregados — Filial ${APP.sigla}${avisoMulti}${avisoInvalidas}`;
       document.getElementById('status-lotes').classList.remove('hidden');
       document.getElementById('processando-msg')?.classList.remove('hidden');
       setTimeout(() => processarDados(), 150);
@@ -2226,6 +2233,41 @@ function carregarLotes(input) {
     mostrarErroValidacao('Erro ao acessar o arquivo. Tente novamente.');
   };
   reader.readAsArrayBuffer(input.files[0]);
+}
+
+// ===== Seleção de filial (quando o arquivo traz mais de uma) =====
+function popularSeletorFilial(siglas) {
+  const sel = document.getElementById('seletor-filial');
+  if (!sel) return;
+  if (!siglas || siglas.length <= 1) {
+    sel.classList.add('hidden');
+    sel.innerHTML = '';
+    return;
+  }
+  sel.innerHTML = siglas.map(s => {
+    const nome = (BASE_FILIAIS[s]?.loja) || s;
+    const n = APP.allLotes.filter(l => l.sigla === s).length;
+    return `<option value="${s}">${s} — ${nome} (${n})</option>`;
+  }).join('');
+  sel.classList.remove('hidden');
+}
+
+// Aplica a filial selecionada: filtra os lotes da filial e (opcionalmente) reprocessa tudo.
+function aplicarFilial(sigla, reprocess) {
+  APP.lotes = APP.allLotes.filter(l => l.sigla === sigla);
+  APP.sigla = sigla || '—';
+  APP.filial = APP.lotes[0]?.filial || '—';
+  const sel = document.getElementById('seletor-filial');
+  if (sel && sel.value !== sigla) sel.value = sigla;
+  if (reprocess) {
+    document.getElementById('processando-msg')?.classList.remove('hidden');
+    setTimeout(() => processarDados(), 50);
+  }
+}
+
+function trocarFilial(sigla) {
+  if (!sigla || sigla === APP.sigla) return;
+  aplicarFilial(sigla, true);
 }
 
 // Sanitização contra XSS — escapa HTML
