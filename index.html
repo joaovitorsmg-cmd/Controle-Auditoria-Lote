@@ -3299,6 +3299,10 @@ function parseDataBR(s) {
 }
 function lojaNome(sig) { return (BASE_FILIAIS[sig] && BASE_FILIAIS[sig].loja) || sig || '—'; }
 function mediana(a) { const s = [...a].sort((x, y) => x - y); const n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : 0; }
+// Normaliza fabricante ("11523 - ALBAUGH AGRO BRASIL LTDA" -> "ALBAUGH AGRO BRASIL LTDA")
+function normFab(s) { return String(s || '').replace(/^\s*\d+\s*-\s*/, '').toUpperCase().replace(/\s+/g, ' ').trim(); }
+// Assinatura estrutural do lote ("053-22-03000" -> "9-9-9"; "ABC12" -> "A9") para comparar formatos
+function loteSig(s) { return String(s).toUpperCase().replace(/[0-9]+/g, '9').replace(/[A-Z]+/g, 'A').replace(/\s+/g, ' ').trim(); }
 
 function computarCacaErros() {
   const lotes = APP.allLotes || [];
@@ -3396,6 +3400,101 @@ function computarCacaErros() {
     }
   }
 
+  // (4) Quantidade ou custo zerado
+  for (const l of lotes) {
+    const qtd = parseFloat(String(l.quantidade)) || 0;
+    const custo = parseFloat(String(l.vlrCusto)) || 0;
+    const disp = String(l.situacao || '').toLowerCase().includes('dispon');
+    if (qtd > 0 && custo <= 0) {
+      findings.push({
+        tipo: 'grave', cat: 'zerado', catLabel: 'Custo zerado com estoque',
+        codProduto: l.codProduto, produto: l.nomeProduto || l.codProduto, lote: String(l.lote || '').trim(),
+        filiais: [l.sigla],
+        titulo: `${l.nomeProduto || l.codProduto} (lote ${String(l.lote || '').trim() || '—'}) na loja ${lojaNome(l.sigla)}: tem ${qtd.toLocaleString('pt-BR')} em estoque mas custo unitário R$ 0,00 — sem valor cadastrado, não dá para avaliar o risco financeiro.`,
+        cols: [{ h: 'LOJA', k: 'loja' }, { h: 'QTD', k: 'qtd' }, { h: 'CUSTO UNIT', k: 'custo' }, { h: 'VENC', k: 'vencimento' }],
+        rows: [{ sigla: l.sigla, loja: lojaNome(l.sigla), qtd: qtd.toLocaleString('pt-BR'), custo: 'R$ 0,00', vencimento: l.dtVencimento || '—', flag: 'erro' }]
+      });
+    } else if (qtd <= 0 && disp) {
+      findings.push({
+        tipo: 'verificar', cat: 'zerado', catLabel: 'Quantidade zerada',
+        codProduto: l.codProduto, produto: l.nomeProduto || l.codProduto, lote: String(l.lote || '').trim(),
+        filiais: [l.sigla],
+        titulo: `${l.nomeProduto || l.codProduto} (lote ${String(l.lote || '').trim() || '—'}) na loja ${lojaNome(l.sigla)}: marcado como Disponível, mas com quantidade zerada — conferir se o lote ainda deveria constar.`,
+        cols: [{ h: 'LOJA', k: 'loja' }, { h: 'QTD', k: 'qtd' }, { h: 'CUSTO UNIT', k: 'custo' }, { h: 'VENC', k: 'vencimento' }],
+        rows: [{ sigla: l.sigla, loja: lojaNome(l.sigla), qtd: '0', custo: formatValor(custo), vencimento: l.dtVencimento || '—', flag: 'erro' }]
+      });
+    }
+  }
+
+  // (5) Fabricante divergente para o mesmo produto — usa a MAIORIA das lojas como referência.
+  // Como multi-fornecedor é realidade, só sinaliza o fabricante MINORITÁRIO (provável cadastro errado).
+  const fabPorProd = {};
+  for (const l of lotes) {
+    const fab = normFab(l.fabricante);
+    if (!fab) continue;
+    const p = fabPorProd[l.codProduto] = fabPorProd[l.codProduto] || {};
+    (p[fab] = p[fab] || []).push(l);
+  }
+  for (const cod in fabPorProd) {
+    const fabs = fabPorProd[cod];
+    const nomes = Object.keys(fabs);
+    if (nomes.length < 2) continue;
+    const total = nomes.reduce((s, f) => s + fabs[f].length, 0);
+    nomes.sort((a, b) => fabs[b].length - fabs[a].length);
+    const dom = nomes[0];
+    const domFiliais = new Set(fabs[dom].map(r => r.sigla)).size;
+    if (domFiliais < 2) continue;                 // sem referência forte da maioria
+    for (let i = 1; i < nomes.length; i++) {
+      const f = nomes[i], recs = fabs[f];
+      const share = recs.length / total;
+      if (share > 0.25 || fabs[dom].length < recs.length * 2) continue;   // multi-fornecedor equilibrado → não sinaliza
+      const fils = [...new Set(recs.map(r => r.sigla))];
+      const prodNome = recs[0].nomeProduto || cod;
+      findings.push({
+        tipo: 'verificar', cat: 'fabricante', catLabel: 'Fabricante divergente',
+        codProduto: cod, produto: prodNome, lote: '',
+        filiais: fils,
+        titulo: `${prodNome}: a maioria das lojas usa o fabricante "${dom}", mas ${fils.map(lojaNome).join(', ')} está com "${f}". Conferir se o fabricante foi cadastrado certo.`,
+        cols: [{ h: 'LOJA', k: 'loja' }, { h: 'FABRICANTE', k: 'fab' }, { h: 'VENC', k: 'vencimento' }],
+        rows: recs.slice(0, 8).map(r => ({ sigla: r.sigla, loja: lojaNome(r.sigla), fab: r.fabricante || '—', vencimento: r.dtVencimento || '—', flag: 'erro' }))
+      });
+    }
+  }
+
+  // (6) Formato de lote fora do padrão do produto — compara a assinatura do lote com a dominante do produto.
+  const sigPorProd = {};
+  for (const l of lotes) {
+    const lote = String(l.lote || '').trim();
+    if (!lote) continue;
+    const sig = loteSig(lote);
+    const p = sigPorProd[l.codProduto] = sigPorProd[l.codProduto] || {};
+    (p[sig] = p[sig] || []).push(l);
+  }
+  for (const cod in sigPorProd) {
+    const sigs = sigPorProd[cod];
+    const names = Object.keys(sigs);
+    if (names.length < 2) continue;
+    const total = names.reduce((s, n) => s + sigs[n].length, 0);
+    if (total < 4) continue;
+    names.sort((a, b) => sigs[b].length - sigs[a].length);
+    const dom = names[0];
+    if (sigs[dom].length / total < 0.6) continue;   // sem padrão dominante claro → não sinaliza
+    for (let i = 1; i < names.length; i++) {
+      const recs = sigs[names[i]];
+      if (recs.length / total > 0.25) continue;      // só minoria
+      for (const l of recs) {
+        findings.push({
+          tipo: 'verificar', cat: 'loteformato', catLabel: 'Formato de lote fora do padrão',
+          codProduto: cod, produto: l.nomeProduto || cod, lote: String(l.lote).trim(),
+          filiais: [l.sigla],
+          titulo: `${l.nomeProduto || cod} (loja ${lojaNome(l.sigla)}): o lote "${String(l.lote).trim()}" tem formato diferente do padrão deste produto nas outras lojas — conferir se foi digitado certo.`,
+          cols: [{ h: 'LOJA', k: 'loja' }, { h: 'LOTE', k: 'loteval' }, { h: 'VENC', k: 'vencimento' }],
+          rows: [{ sigla: l.sigla, loja: lojaNome(l.sigla), loteval: String(l.lote).trim(), vencimento: l.dtVencimento || '—', flag: 'erro' }]
+        });
+      }
+    }
+  }
+
   findings.sort((a, b) => (a.tipo === b.tipo ? 0 : (a.tipo === 'grave' ? -1 : 1)));
   APP.cacaErros = findings;
   APP.filteredCacaErros = [...findings];
@@ -3428,6 +3527,7 @@ function renderCacaErros() {
   renderListaCacaErros();
 }
 
+const CACAERROS_MAX_RENDER = 300;
 function renderListaCacaErros() {
   const cont = document.getElementById('cacaerros-lista');
   const data = APP.filteredCacaErros;
@@ -3435,15 +3535,19 @@ function renderListaCacaErros() {
     cont.innerHTML = `<div class="empty" style="padding:40px;"><i class="ti ti-mood-smile" style="color:var(--verde)"></i><p>Nenhuma inconsistência nesta seleção.</p></div>`;
     return;
   }
-  cont.innerHTML = data.map(f => {
+  const COLS_DEFAULT = [{ h: 'LOJA', k: 'loja' }, { h: 'FABRICAÇÃO', k: 'fabricacao' }, { h: 'VENCIMENTO', k: 'vencimento' }];
+  const slice = data.slice(0, CACAERROS_MAX_RENDER);
+  const cardsHTML = slice.map(f => {
+    const cols = f.cols || COLS_DEFAULT;
     const badge = f.tipo === 'grave'
       ? '<span style="background:rgba(239,68,68,.15);color:#f87171;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;">Grave</span>'
       : '<span style="background:rgba(245,158,11,.15);color:#fbbf24;font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;">A verificar</span>';
-    const rows = f.rows.map(r => `<tr>
-        <td style="padding:9px 12px;font-weight:600;${r.flag === 'erro' ? 'color:#f87171;' : ''}">${r.loja}${r.flag === 'erro' ? ' <i class="ti ti-alert-triangle" style="font-size:11px;" title="Provável origem do erro"></i>' : ''}</td>
-        <td style="padding:9px 12px;">${r.fabricacao}</td>
-        <td style="padding:9px 12px;">${r.vencimento}</td>
-      </tr>`).join('');
+    const head = cols.map(c => `<th style="padding:7px 12px;font-weight:600;">${c.h}</th>`).join('');
+    const rows = f.rows.map(r => '<tr>' + cols.map((c, ci) => {
+      const val = r[c.k] != null ? r[c.k] : '—';
+      if (ci === 0) return `<td style="padding:9px 12px;font-weight:600;${r.flag === 'erro' ? 'color:#f87171;' : ''}">${val}${r.flag === 'erro' ? ' <i class="ti ti-alert-triangle" style="font-size:11px;" title="Provável origem do erro"></i>' : ''}</td>`;
+      return `<td style="padding:9px 12px;">${val}</td>`;
+    }).join('') + '</tr>').join('');
     return `<div style="background:var(--bg3);border:1px solid var(--border);border-left:3px solid ${f.tipo === 'grave' ? '#ef4444' : '#f59e0b'};border-radius:10px;padding:14px 16px;margin-bottom:12px;">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
         ${badge}<span style="font-size:11px;color:var(--texto-muted);">${f.catLabel}</span>
@@ -3452,11 +3556,13 @@ function renderListaCacaErros() {
       </div>
       <div style="font-size:12.5px;color:var(--texto);line-height:1.6;margin-bottom:10px;">${f.titulo}</div>
       <table style="width:100%;border-collapse:collapse;font-size:12px;">
-        <thead><tr style="color:var(--texto-muted);text-align:left;border-bottom:1px solid var(--border);">
-          <th style="padding:7px 12px;font-weight:600;">LOJA</th><th style="padding:7px 12px;font-weight:600;">FABRICAÇÃO</th><th style="padding:7px 12px;font-weight:600;">VENCIMENTO</th>
-        </tr></thead><tbody>${rows}</tbody></table>
+        <thead><tr style="color:var(--texto-muted);text-align:left;border-bottom:1px solid var(--border);">${head}</tr></thead><tbody>${rows}</tbody></table>
     </div>`;
   }).join('');
+  const aviso = data.length > CACAERROS_MAX_RENDER
+    ? `<div style="text-align:center;color:var(--texto-muted);font-size:12px;padding:10px;">Mostrando ${CACAERROS_MAX_RENDER} de ${data.length.toLocaleString('pt-BR')} inconsistências. Use os filtros ou exporte para Excel para ver todas.</div>`
+    : '';
+  cont.innerHTML = cardsHTML + aviso;
 }
 
 function filtrarCacaErros() {
@@ -3473,16 +3579,55 @@ function filtrarCacaErros() {
 }
 
 function exportarCacaErrosExcel() {
-  const rows = [];
-  APP.filteredCacaErros.forEach((f, i) => {
-    f.rows.forEach(r => {
-      rows.push({ '#': i + 1, 'Tipo': f.tipo === 'grave' ? 'Grave' : 'A verificar', 'Categoria': f.catLabel, 'Cód Produto': f.codProduto, 'Produto': f.produto, 'Lote': f.lote, 'Loja': r.loja, 'Fabricação': r.fabricacao, 'Vencimento': r.vencimento, 'Provável erro': r.flag === 'erro' ? 'Sim' : '', 'Descrição': f.titulo });
-    });
-  });
+  const rows = APP.filteredCacaErros.map((f, i) => ({
+    '#': i + 1,
+    'Tipo': f.tipo === 'grave' ? 'Grave' : 'A verificar',
+    'Categoria': f.catLabel,
+    'Cód Produto': f.codProduto,
+    'Produto': f.produto,
+    'Lote': f.lote,
+    'Lojas envolvidas': f.filiais.map(lojaNome).join(', '),
+    'Descrição / Ação': f.titulo,
+  }));
   const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'Resultado': 'Nenhuma inconsistência' }]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Caça-Erros');
   XLSX.writeFile(wb, `caca_erros_${new Date().toLocaleDateString('pt-BR').split('/').join('-')}.xlsx`);
+}
+
+// Seção de correções de dados no Checklist — inconsistências (Caça-Erros) que envolvem a filial auditada.
+function renderChecklistCorrecoes() {
+  const sig = APP.sigla;
+  const itens = (APP.cacaErros || []).filter(f => f.filiais.includes(sig));
+  if (!itens.length) return '';
+  const graves = itens.filter(f => f.tipo === 'grave').length;
+  const probs = {
+    divergencia: 'Datas divergem de outra loja para o mesmo lote',
+    impossivel: 'Data impossível',
+    padrao: 'Validade fora do padrão do produto',
+    zerado: 'Quantidade ou custo zerado',
+    fabricante: 'Fabricante diferente do padrão deste produto',
+    loteformato: 'Formato de lote fora do padrão',
+  };
+  const item = f => {
+    const r = f.rows.find(x => x.sigla === sig) || f.rows[0];
+    const cor = f.tipo === 'grave' ? '#ef4444' : '#f59e0b';
+    const detalhe = [r.fabricacao ? 'Fab: ' + r.fabricacao : '', r.vencimento ? 'Venc: ' + r.vencimento : '', r.fab ? 'Fabricante: ' + r.fab : '', r.qtd != null ? 'Qtd: ' + r.qtd : '', r.loteval ? 'Lote: ' + r.loteval : ''].filter(Boolean).join(' · ');
+    return `<div class="checklist-item" style="align-items:flex-start;">
+      <div class="check-num" style="background:${cor};">!</div>
+      <div class="check-info">
+        <div class="check-detail"><strong style="color:var(--branco);">${f.produto}</strong>${f.lote ? ` · Lote <strong>${f.lote}</strong>` : ''} <span style="font-size:10px;color:${cor};font-weight:700;">${f.tipo === 'grave' ? 'GRAVE' : 'VERIFICAR'}</span></div>
+        <div style="font-size:11.5px;color:var(--texto-muted);margin-top:3px;line-height:1.5;">${probs[f.cat] || f.catLabel}${detalhe ? ' — ' + detalhe : ''}. <span style="color:${cor};">Conferir físico e corrigir no sistema.</span></div>
+      </div>
+    </div>`;
+  };
+  return `<div class="checklist-card" style="border:1px solid rgba(239,68,68,.35);">
+    <div class="checklist-header" style="background:rgba(239,68,68,.08);">
+      <div class="checklist-linha"><i class="ti ti-bug" style="margin-right:6px;color:#ef4444;"></i>Correções de dados no sistema — ${sig}</div>
+      <div class="checklist-count">${itens.length} item${itens.length > 1 ? 's' : ''} · ${graves} grave${graves !== 1 ? 's' : ''} (Caça-Erros)</div>
+    </div>
+    <div class="checklist-produto">${itens.map(item).join('')}</div>
+  </div>`;
 }
 
 // Metadados das rotas de destinação (ordem, cor, rótulo executivo)
@@ -3616,9 +3761,10 @@ function renderTabelaSemGiro(page) {
 function renderChecklist() {
   const sel = getChecklistSelecao();
   const container = document.getElementById('checklist-container');
+  const correcoesHTML = renderChecklistCorrecoes();
 
   if (Object.keys(sel).length === 0) {
-    container.innerHTML = '<div class="empty"><i class="ti ti-circle-check"></i><p>Nenhum lote de risco encontrado para gerar checklist</p><p style="font-size:11px;margin-top:4px;">Use a busca acima para adicionar lotes manualmente.</p></div>';
+    container.innerHTML = correcoesHTML + '<div class="empty"><i class="ti ti-circle-check"></i><p>Nenhum lote de risco encontrado para gerar checklist</p><p style="font-size:11px;margin-top:4px;">Use a busca acima para adicionar lotes manualmente.</p></div>';
     return;
   }
 
@@ -3629,7 +3775,7 @@ function renderChecklist() {
     return mb - ma;
   });
 
-  container.innerHTML = linhasOrdenadas.map(([linha, produtos]) => {
+  container.innerHTML = correcoesHTML + linhasOrdenadas.map(([linha, produtos]) => {
     const totalLotes = produtos.reduce((s, p) => s + p.lotes.length, 0);
     let n = 0;
     return `
