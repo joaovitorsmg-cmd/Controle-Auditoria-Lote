@@ -3631,7 +3631,7 @@ function computarAlerta() {
 function renderAlerta() {
   const resp = document.getElementById('alerta-responsavel');
   const info = BASE_FILIAIS[APP.sigla] || {};
-  const filialNome = APP.lotes[0]?.descricao?.split('(')[0]?.trim() || info.loja || APP.sigla;
+  const filialNome = info.loja || APP.sigla;
   resp.innerHTML = `
     <div style="display:flex; flex-wrap:wrap; gap:18px; align-items:center; background:var(--bg3); border:1px solid var(--border); border-radius:10px; padding:12px 16px;">
       <div><div style="font-size:10px; color:var(--texto-muted); text-transform:uppercase; letter-spacing:.5px;">Filial</div><div style="font-weight:700;">${APP.sigla} — ${filialNome}</div></div>
@@ -4632,7 +4632,7 @@ function abrirModalImpressao() {
 
   const hoje = new Date().toLocaleDateString('pt-BR');
   const hora = new Date().toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
-  const filialNome = APP.lotes[0]?.descricao?.replace(/\(.*?\)/g,'').trim() || APP.sigla;
+  const filialNome = lojaNome(APP.sigla);
   const totalRisco = APP.emRisco.reduce((s,l) => s+l.valorRisco, 0);
   const totalVencido = APP.vencidos.reduce((s,l) => s+l.vlrCustoTotal, 0);
 
@@ -4830,7 +4830,7 @@ function baixarHTMLMobile() {
     porLinha[l.linha].push(l);
   }
   const hoje = new Date().toLocaleDateString('pt-BR');
-  const filialNome = APP.lotes[0]?.descricao?.replace(/\(.*?\)/g,'').trim() || APP.sigla;
+  const filialNome = lojaNome(APP.sigla);
 
   let itensHTML = '';
   let itemIdx = 0;
@@ -5940,7 +5940,7 @@ function normalizarFilialArq(sigla, loja) {
 
 // Botão Registrar: vai direto ao registro (faturamento é gerenciado no Ranking Geral)
 function _gravarRegistroVencidos() {
-  const filialNome = (APP.lotes[0]?.descricao?.split('(')[0]?.trim() || APP.sigla || '—');
+  const filialNome = lojaNome(APP.sigla) || '—';
   const gerente = APP.lotes[0]?.gerente || '—';
   const totalVencidos = APP.vencidos.length;
   const valorVencidos = APP.vencidos.reduce((s, l) => s + l.vlrCustoTotal, 0);
@@ -6108,15 +6108,15 @@ function exportarArquivoVencidosPadrao() {
   const d = APP.dataAuditoria || new Date();
   const mes = String(d.getMonth() + 1).padStart(2, '0');
   const ano = d.getFullYear();
-  const nomeArq = normalizarFilialArq(APP.sigla, APP.lotes[0]?.descricao) + `_VENCIDOS_AUDT_${mes}_${ano}`;
+  const infoFil = BASE_FILIAIS[String(APP.sigla||'').toUpperCase()] || {};
+  const nomeArq = normalizarFilialArq(APP.sigla, infoFil.loja) + `_VENCIDOS_AUDT_${mes}_${ano}`;
 
   // Estrutura de dados exportada
-  const infoFil = BASE_FILIAIS[String(APP.sigla||'').toUpperCase()] || {};
   const payload = {
     versao: '1.1',
     tipo: 'VENCIDOS_AUDT',
     filial: APP.sigla,
-    filialNome: APP.lotes[0]?.descricao?.split('(')[0]?.trim() || infoFil.loja || APP.sigla,
+    filialNome: infoFil.loja || APP.sigla,
     gerente: APP.lotes[0]?.gerente || infoFil.gerente || '',
     regional: infoFil.regional || '',
     auditor: infoFil.auditor || '',
@@ -7837,7 +7837,7 @@ function exportarHistoricoUnificado() {
   const payload = { versao: 1, tipo: 'HISTORICO_AUDITORIA_UNIFICADO', vencidos: VENC_HIST, pedidos: H_DADOS };
   const dt = new Date().toLocaleDateString('pt-BR').split('/').join('-');
   const sigla = APP.sigla || APP_PED.fi?.sigla || '';
-  const loja = APP.lotes[0]?.descricao?.split('(')[0]?.trim() || APP_PED.fi?.loja || '';
+  const loja = (BASE_FILIAIS[sigla]?.loja) || APP_PED.fi?.loja || '';
   const filial = normalizarFilialArq(sigla, loja);
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
   const url = URL.createObjectURL(blob);
